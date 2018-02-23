@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from torch.nn.modules.batchnorm import _BatchNorm
 from torch.nn.parallel._functions import ReduceAddCoalesced, Broadcast
+from torch.autograd import Variable
 
 from .comm import SyncMaster
 
@@ -36,7 +37,7 @@ _MasterMessage = collections.namedtuple('_MasterMessage', ['sum', 'inv_std'])
 
 
 class _SynchronizedBatchNorm(_BatchNorm):
-    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True):
+    def __init__(self, num_features, eps=1e-5, momentum=0.01, affine=False, renorm=True, rmax=3, dmax=0):
         super(_SynchronizedBatchNorm, self).__init__(num_features, eps=eps, momentum=momentum, affine=affine)
 
         self._sync_master = SyncMaster(self._data_parallel_master)
@@ -44,6 +45,9 @@ class _SynchronizedBatchNorm(_BatchNorm):
         self._is_parallel = False
         self._parallel_id = None
         self._slave_pipe = None
+        self.renorm = renorm
+        self.rmax = rmax
+        self.dmax = dmax
 
     def forward(self, input):
         # If it is not parallel computation or is in evaluation mode, use PyTorch's implementation.
@@ -68,12 +72,18 @@ class _SynchronizedBatchNorm(_BatchNorm):
             mean, inv_std = self._slave_pipe.run_slave(_ChildMessage(input_sum, input_ssum, sum_size))
 
         # Compute the output.
-        if self.affine:
+        if self.affine and not self.renorm:
             # MJY:: Fuse the multiplication for speed.
             output = (input - _unsqueeze_ft(mean)) * _unsqueeze_ft(inv_std * self.weight) + _unsqueeze_ft(self.bias)
         else:
             output = (input - _unsqueeze_ft(mean)) * _unsqueeze_ft(inv_std)
-
+            if self.renorm:
+                sig = torch.pow(self.running_var,0.5)
+                r = torch.clamp(1/sig/inv_std.data, 1/self.rmax, self.rmax)
+                d = torch.clamp((mean.data-self.running_mean)/sig, -self.dmax, self.dmax)
+                output = output*_unsqueeze_ft(Variable(r))+_unsqueeze_ft(Variable(d))
+            if self.affine:
+                output = output*_unsqueeze_ft(self.weight)+_unsqueeze_ft(self.bias)
         # Reshape it.
         return output.view(input_shape)
 
@@ -118,11 +128,10 @@ class _SynchronizedBatchNorm(_BatchNorm):
         sumvar = ssum - sum_ * mean
         unbias_var = sumvar / (size - 1)
         bias_var = sumvar / size
-
         self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.data
         self.running_var = (1 - self.momentum) * self.running_var + self.momentum * unbias_var.data
-
         return mean, bias_var.clamp(self.eps) ** -0.5
+
 
 
 class SynchronizedBatchNorm1d(_SynchronizedBatchNorm):
